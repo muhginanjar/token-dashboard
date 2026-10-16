@@ -1,0 +1,12 @@
+{
+  "name": "dashboard-token",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Realtime, zero-dependency usage dashboard for a single API token (OpenRouter or any OpenAI-compatible provider via proxy)",
+  "engines": { "node": ">=20.12" },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  }
+}
