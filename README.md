@@ -36,6 +36,24 @@ For providers without a balance API (OpenAI, Groq, etc.), use `PROVIDER=none` an
 
 History is stored in `data/history.json` (capped at 2000 snapshots and 500 requests).
 
+## Basic auth
+
+Set `AUTH_PASSWORD` (and optionally `AUTH_USER`, default `admin`) in `.env` to protect the dashboard and the proxy:
+
+```bash
+AUTH_USER=admin
+AUTH_PASSWORD=a-long-random-password
+```
+
+- The browser will prompt for the username and password when opening the dashboard.
+- Proxy clients use the password **as their API key**, sent as `Authorization: Bearer …` or `x-api-key`. The proxy checks it, strips it, and sends `API_KEY` upstream instead, so the real key never leaves the server:
+
+  ```python
+  client = OpenAI(base_url="http://127.0.0.1:8787/proxy/v1", api_key="a-long-random-password")
+  ```
+
+Leave `AUTH_PASSWORD` empty to disable auth. Always enable it when `HOST` is not `127.0.0.1`. Basic auth sends the password with every request, so put the server behind HTTPS (a reverse proxy or tunnel) when it's reachable over the internet.
+
 ## Running in the background with pm2
 
 ```bash

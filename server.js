@@ -6,6 +6,7 @@
 //              records token counts per request, so any provider can be tracked live.
 
 import http from 'node:http';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,9 +20,39 @@ const API_KEY = process.env.API_KEY || process.env.OPENROUTER_API_KEY || '';
 const PROVIDER = (process.env.PROVIDER || 'openrouter').toLowerCase();
 const POLL_MS = Math.max(2000, Number(process.env.POLL_MS || 5000));
 const UPSTREAM_BASE = (process.env.UPSTREAM_BASE || 'https://openrouter.ai/api').replace(/\/$/, '');
+// Basic auth is on whenever AUTH_PASSWORD is set.
+const AUTH_USER = process.env.AUTH_USER || 'admin';
+const AUTH_PASSWORD = process.env.AUTH_PASSWORD || '';
 const DATA_FILE = path.join(ROOT, 'data', 'history.json');
 const MAX_SNAPSHOTS = 2000;
 const MAX_REQUESTS = 500;
+
+// ---------- auth ----------
+
+// Hash first so timingSafeEqual gets equal-length buffers and length isn't leaked.
+function safeEqual(a, b) {
+  const h = (s) => crypto.createHash('sha256').update(s).digest();
+  return crypto.timingSafeEqual(h(a), h(b));
+}
+
+function basicAuthOk(header) {
+  const m = /^Basic\s+(\S+)$/i.exec(header || '');
+  if (!m) return false;
+  const decoded = Buffer.from(m[1], 'base64').toString();
+  const i = decoded.indexOf(':');
+  if (i < 0) return false;
+  // Bitwise & so both comparisons always run.
+  return Boolean(safeEqual(decoded.slice(0, i), AUTH_USER) & safeEqual(decoded.slice(i + 1), AUTH_PASSWORD));
+}
+
+// Proxy clients are SDKs that only know how to send an API key, so they may
+// authenticate with the password as their key (Bearer or x-api-key) as well.
+function proxyAuthOk(headers) {
+  if (basicAuthOk(headers.authorization)) return true;
+  const bearer = /^Bearer\s+(.+)$/i.exec(headers.authorization || '')?.[1];
+  const key = bearer ?? headers['x-api-key'];
+  return key != null && safeEqual(key, AUTH_PASSWORD);
+}
 
 // ---------- state ----------
 
@@ -166,8 +197,15 @@ async function proxy(req, res, upstreamPath) {
   for (const [k, v] of Object.entries(req.headers)) {
     if (!['host', 'connection', 'content-length', 'accept-encoding'].includes(k)) headers[k] = v;
   }
-  // Inject the dashboard's key unless the client brought its own.
-  if (!headers.authorization && !headers['x-api-key'] && API_KEY) headers.authorization = `Bearer ${API_KEY}`;
+  if (AUTH_PASSWORD) {
+    // The client's credential was the dashboard password — never forward it upstream.
+    delete headers.authorization;
+    delete headers['x-api-key'];
+    if (API_KEY) headers.authorization = `Bearer ${API_KEY}`;
+  } else if (!headers.authorization && !headers['x-api-key'] && API_KEY) {
+    // Inject the dashboard's key unless the client brought its own.
+    headers.authorization = `Bearer ${API_KEY}`;
+  }
 
   let upstream;
   try {
@@ -241,7 +279,16 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
 
   if (url.pathname.startsWith('/proxy/')) {
+    if (AUTH_PASSWORD && !proxyAuthOk(req.headers)) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ error: { message: 'Unauthorized: use the dashboard password as your API key' } }));
+    }
     return proxy(req, res, url.pathname.slice('/proxy'.length) + url.search);
+  }
+
+  if (AUTH_PASSWORD && !basicAuthOk(req.headers.authorization)) {
+    res.writeHead(401, { 'www-authenticate': 'Basic realm="Token Dashboard", charset="UTF-8"' });
+    return res.end('Unauthorized');
   }
 
   if (url.pathname === '/events') {
@@ -282,4 +329,8 @@ server.listen(PORT, HOST, () => {
   console.log(`Dashboard  → http://${HOST}:${PORT}`);
   console.log(`Proxy      → http://${HOST}:${PORT}/proxy  (upstream ${UPSTREAM_BASE})`);
   console.log(`Provider   → ${PROVIDER}, polling every ${POLL_MS / 1000}s${API_KEY ? '' : '  ⚠ API_KEY is empty'}`);
+  console.log(`Auth       → ${AUTH_PASSWORD ? `basic auth on (user "${AUTH_USER}")` : 'off'}`);
+  if (!AUTH_PASSWORD && !['127.0.0.1', 'localhost', '::1'].includes(HOST)) {
+    console.warn('⚠ Listening on a non-local address without AUTH_PASSWORD — anyone on the network can use your key through the proxy.');
+  }
 });
