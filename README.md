@@ -36,6 +36,23 @@ For providers without a balance API (OpenAI, Groq, etc.), use `PROVIDER=none` an
 
 History is stored in `data/history.json` (capped at 2000 snapshots and 500 requests).
 
+## Telegram alerts
+
+Get a Telegram message when spend crosses a dollar threshold (OpenRouter only):
+
+```bash
+TELEGRAM_BOT_TOKEN=123456:ABC...     # from @BotFather
+TELEGRAM_CHAT_ID=987654321           # message your bot, then open https://api.telegram.org/bot<TOKEN>/getUpdates
+ALERT_USAGE_ABOVE=40,45              # total used
+ALERT_DAILY_ABOVE=2                  # used today (UTC)
+ALERT_MONTHLY_ABOVE=30               # used this month
+ALERT_REMAINING_BELOW=10,5,1         # remaining limit
+```
+
+- Each threshold notifies **once** per crossing, and is re-armed when the value is back on the safe side (a new day/month, a limit top-up). Sent alerts are remembered across restarts.
+- While alerts are configured, the server keeps checking in the background every `ALERT_POLL_MS` (default 60 s) even with no dashboard tab open.
+- Check the setup with `npm run test-alert`.
+
 ## Basic auth
 
 Set `AUTH_PASSWORD` (and optionally `AUTH_USER`, default `admin`) in `.env` to protect the dashboard and the proxy:

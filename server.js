@@ -23,6 +23,19 @@ const UPSTREAM_BASE = (process.env.UPSTREAM_BASE || 'https://openrouter.ai/api')
 // Basic auth is on whenever AUTH_PASSWORD is set.
 const AUTH_USER = process.env.AUTH_USER || 'admin';
 const AUTH_PASSWORD = process.env.AUTH_PASSWORD || '';
+// Telegram alerts — each rule is a comma-separated list of dollar thresholds.
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+const ALERT_POLL_MS = Math.max(10000, Number(process.env.ALERT_POLL_MS || 60000));
+const parseList = (v) => (v || '').split(',').map((x) => parseFloat(x)).filter((x) => Number.isFinite(x));
+const ALERT_RULES = [
+  // [metric, direction, label, thresholds]
+  ['usage', 'above', 'Total used', parseList(process.env.ALERT_USAGE_ABOVE)],
+  ['daily', 'above', 'Used today', parseList(process.env.ALERT_DAILY_ABOVE)],
+  ['monthly', 'above', 'Used this month', parseList(process.env.ALERT_MONTHLY_ABOVE)],
+  ['remaining', 'below', 'Limit remaining', parseList(process.env.ALERT_REMAINING_BELOW)],
+].flatMap(([metric, dir, label, list]) => list.map((value) => ({ id: `${metric}:${dir}:${value}`, metric, dir, label, value })));
+const ALERTS_ON = Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID && ALERT_RULES.length);
 const DATA_FILE = path.join(ROOT, 'data', 'history.json');
 const MAX_SNAPSHOTS = 2000;
 const MAX_REQUESTS = 500;
@@ -64,12 +77,14 @@ const state = {
   lastPoll: null,
   snapshots: [],      // [{t, usage}] — only appended when usage changes
   requests: [],       // [{t, model, prompt, completion, total, cost, ms, status}]
+  firedAlerts: [],    // rule ids already notified; re-armed once the value is back on the safe side
 };
 
 try {
   const saved = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
   state.snapshots = saved.snapshots || [];
   state.requests = saved.requests || [];
+  state.firedAlerts = saved.firedAlerts || [];
 } catch {}
 
 let saveTimer = null;
@@ -78,7 +93,7 @@ function scheduleSave() {
   saveTimer = setTimeout(() => {
     saveTimer = null;
     fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
-    fs.writeFile(DATA_FILE, JSON.stringify({ snapshots: state.snapshots, requests: state.requests }), () => {});
+    fs.writeFile(DATA_FILE, JSON.stringify({ snapshots: state.snapshots, requests: state.requests, firedAlerts: state.firedAlerts }), () => {});
   }, 2000);
 }
 
@@ -142,6 +157,7 @@ async function poll() {
         broadcast('snapshot', snap);
         scheduleSave();
       }
+      if (ALERTS_ON) await checkAlerts(key);
     }
   } catch (e) {
     state.error = e.message;
@@ -163,6 +179,57 @@ function startPolling() {
 function stopPolling() {
   clearInterval(pollTimer);
   pollTimer = null;
+}
+
+// ---------- alerts ----------
+
+async function sendTelegram(text) {
+  const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML', disable_web_page_preview: true }),
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!r.ok) throw new Error(`Telegram ${r.status}: ${(await r.text()).slice(0, 200)}`);
+}
+
+const money = (n) => (n == null ? '—' : `$${n.toFixed(2)}`);
+const escHtml = (s) => String(s ?? '').replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
+
+function summary(key) {
+  const lines = [`Total used: ${money(key.usage)}${key.limit != null ? ` of ${money(key.limit)}` : ''}`];
+  if (key.remaining != null) lines.push(`Remaining: ${money(key.remaining)}`);
+  lines.push(`Today: ${money(key.daily)} · Month: ${money(key.monthly)}`);
+  if (key.label) lines.push(`Key: <code>${escHtml(key.label)}</code>`);
+  return lines.join('\n');
+}
+
+async function checkAlerts(key) {
+  let changed = false;
+  for (const rule of ALERT_RULES) {
+    const v = key[rule.metric];
+    if (v == null) continue;
+    const tripped = rule.dir === 'above' ? v >= rule.value : v <= rule.value;
+    const fired = state.firedAlerts.includes(rule.id);
+    if (!tripped && fired) {
+      // Daily/monthly totals reset, limits get topped up — arm the rule again.
+      state.firedAlerts = state.firedAlerts.filter((id) => id !== rule.id);
+      changed = true;
+    } else if (tripped && !fired) {
+      const head = rule.dir === 'above'
+        ? `⚠️ <b>${rule.label}</b> reached ${money(v)} (alert at ${money(rule.value)})`
+        : `🔻 <b>${rule.label}</b> is down to ${money(v)} (alert at ${money(rule.value)})`;
+      try {
+        await sendTelegram(`${head}\n\n${summary(key)}`);
+        state.firedAlerts.push(rule.id);
+        changed = true;
+        console.log(`Alert sent: ${rule.id}`);
+      } catch (e) {
+        console.error(`Alert ${rule.id} not sent, will retry: ${e.message}`);
+      }
+    }
+  }
+  if (changed) scheduleSave();
 }
 
 // ---------- proxy ----------
@@ -268,7 +335,7 @@ async function proxy(req, res, upstreamPath) {
   broadcast('request', record);
   scheduleSave();
   // Spend changed — refresh balance right away instead of waiting for the next tick.
-  if (pollTimer) setTimeout(poll, 1500);
+  if (pollTimer || ALERTS_ON) setTimeout(poll, 1500);
 }
 
 // ---------- http ----------
@@ -325,12 +392,34 @@ const server = http.createServer(async (req, res) => {
   res.end('Not found');
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`Dashboard  → http://${HOST}:${PORT}`);
-  console.log(`Proxy      → http://${HOST}:${PORT}/proxy  (upstream ${UPSTREAM_BASE})`);
-  console.log(`Provider   → ${PROVIDER}, polling every ${POLL_MS / 1000}s${API_KEY ? '' : '  ⚠ API_KEY is empty'}`);
-  console.log(`Auth       → ${AUTH_PASSWORD ? `basic auth on (user "${AUTH_USER}")` : 'off'}`);
-  if (!AUTH_PASSWORD && !['127.0.0.1', 'localhost', '::1'].includes(HOST)) {
-    console.warn('⚠ Listening on a non-local address without AUTH_PASSWORD — anyone on the network can use your key through the proxy.');
+function startServer() {
+  // With alerts, keep a slow background poll so notifications arrive with the dashboard closed.
+  if (ALERTS_ON) {
+    poll();
+    setInterval(() => { if (!pollTimer) poll(); }, ALERT_POLL_MS);
   }
-});
+  server.listen(PORT, HOST, () => {
+    console.log(`Dashboard  → http://${HOST}:${PORT}`);
+    console.log(`Proxy      → http://${HOST}:${PORT}/proxy  (upstream ${UPSTREAM_BASE})`);
+    console.log(`Provider   → ${PROVIDER}, polling every ${POLL_MS / 1000}s${API_KEY ? '' : '  ⚠ API_KEY is empty'}`);
+    console.log(`Alerts     → ${ALERTS_ON ? `Telegram, ${ALERT_RULES.length} rule(s), background poll every ${ALERT_POLL_MS / 1000}s` : 'off'}`);
+    console.log(`Auth       → ${AUTH_PASSWORD ? `basic auth on (user "${AUTH_USER}")` : 'off'}`);
+    if (!AUTH_PASSWORD && !['127.0.0.1', 'localhost', '::1'].includes(HOST)) {
+      console.warn('⚠ Listening on a non-local address without AUTH_PASSWORD — anyone on the network can use your key through the proxy.');
+    }
+  });
+}
+
+// `npm run test-alert` — check the Telegram setup without waiting for a threshold.
+if (process.argv.includes('--test-alert')) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.error('Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env first.');
+    process.exit(1);
+  }
+  const rules = ALERT_RULES.map((r) => `• ${r.label} ${r.dir} ${money(r.value)}`).join('\n') || '• (no rules set)';
+  sendTelegram(`✅ <b>Token dashboard</b> test alert\n\nActive rules:\n${rules}`)
+    .then(() => { console.log('Test alert sent.'); process.exit(0); })
+    .catch((e) => { console.error(e.message); process.exit(1); });
+} else {
+  startServer();
+}
