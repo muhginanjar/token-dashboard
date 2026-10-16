@@ -26,6 +26,8 @@ const AUTH_PASSWORD = process.env.AUTH_PASSWORD || '';
 // Telegram alerts — each rule is a comma-separated list of dollar thresholds.
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+// Friendly name shown in alerts, to tell tokens apart when several dashboards report to one chat.
+const TOKEN_NAME = process.env.TOKEN_NAME || '';
 const ALERT_POLL_MS = Math.max(10000, Number(process.env.ALERT_POLL_MS || 60000));
 const parseList = (v) => (v || '').split(',').map((x) => parseFloat(x)).filter((x) => Number.isFinite(x));
 const ALERT_RULES = [
@@ -196,11 +198,23 @@ async function sendTelegram(text) {
 const money = (n) => (n == null ? '—' : `$${n.toFixed(2)}`);
 const escHtml = (s) => String(s ?? '').replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
 
+// Never the full key — only both ends, so test and real alerts show the same thing.
+// Falls back to OpenRouter's (already masked) label if API_KEY is missing.
+function maskedKey(key) {
+  if (!API_KEY) return key?.label || null;
+  return API_KEY.length > 16 ? `${API_KEY.slice(0, 9)}…${API_KEY.slice(-4)}` : '…' + API_KEY.slice(-4);
+}
+
+function tokenLine(key) {
+  const masked = maskedKey(key);
+  const parts = [TOKEN_NAME && `<b>${escHtml(TOKEN_NAME)}</b>`, masked && `<code>${escHtml(masked)}</code>`].filter(Boolean);
+  return `🔑 ${parts.join(' · ') || 'unknown token'}`;
+}
+
 function summary(key) {
   const lines = [`Total used: ${money(key.usage)}${key.limit != null ? ` of ${money(key.limit)}` : ''}`];
   if (key.remaining != null) lines.push(`Remaining: ${money(key.remaining)}`);
   lines.push(`Today: ${money(key.daily)} · Month: ${money(key.monthly)}`);
-  if (key.label) lines.push(`Key: <code>${escHtml(key.label)}</code>`);
   return lines.join('\n');
 }
 
@@ -220,7 +234,7 @@ async function checkAlerts(key) {
         ? `⚠️ <b>${rule.label}</b> reached ${money(v)} (alert at ${money(rule.value)})`
         : `🔻 <b>${rule.label}</b> is down to ${money(v)} (alert at ${money(rule.value)})`;
       try {
-        await sendTelegram(`${head}\n\n${summary(key)}`);
+        await sendTelegram(`${tokenLine(key)}\n${head}\n\n${summary(key)}`);
         state.firedAlerts.push(rule.id);
         changed = true;
         console.log(`Alert sent: ${rule.id}`);
@@ -417,7 +431,7 @@ if (process.argv.includes('--test-alert')) {
     process.exit(1);
   }
   const rules = ALERT_RULES.map((r) => `• ${r.label} ${r.dir} ${money(r.value)}`).join('\n') || '• (no rules set)';
-  sendTelegram(`✅ <b>Token dashboard</b> test alert\n\nActive rules:\n${rules}`)
+  sendTelegram(`${tokenLine(null)}\n✅ <b>Token dashboard</b> test alert\n\nActive rules:\n${rules}`)
     .then(() => { console.log('Test alert sent.'); process.exit(0); })
     .catch((e) => { console.error(e.message); process.exit(1); });
 } else {
